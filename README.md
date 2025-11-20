@@ -8,10 +8,8 @@ This repository contains the source code and analysis notebooks for the research
 
 This study proposes a framework to quantify the uncertainty in household energy autonomy. By integrating **Chronos** (a pre-trained time-series foundation model) with **Monte Carlo Simulation**, we probabilistically forecast the **Energy Self-Sufficiency Ratio (ESSR)** over the medium term.
 
-The code covers the entire workflow from data preprocessing and Exploratory Data Analysis (EDA) to probabilistic forecasting and ESSR risk evaluation.
-
 ### Key Features
-* **Probabilistic Forecasting**: Implementation of Chronos model finetuned on household energy data.
+* **Probabilistic Forecasting**: Implementation of Chronos model fine-tuned on household energy data.
 * **ESSR Evaluation**: Monte Carlo Simulation to derive probability distributions of annual and monthly ESSR.
 * **Baseline Comparison**: Performance comparison with Seasonal Naive (SN) models.
 
@@ -22,9 +20,9 @@ The code covers the entire workflow from data preprocessing and Exploratory Data
 If you use this code or ideas in your research, please cite our paper:
 
 > **Title**: Probabilistic Forecasting of Household Energy and Evaluation of Energy Self-Sufficiency Rate Using Pre-trained Time Series Models  
-> **Authors**: Hiroki Yamasaki, Libei Wu, and Masaaki Nagahara  
-> **Journal**: *Energies* (Submitted/Published, 2025)  
-> **DOI**: [INSERT DOI HERE if available]
+> **Authors**:  
+> **Journal**: *Energies* (Submitted, 2025)  
+> **DOI**: 
 
 ---
 
@@ -34,7 +32,7 @@ If you use this code or ideas in your research, please cite our paper:
 The actual dataset used in the paper (HEMS data from 39 households in Kitakyushu City) contains private information and **cannot be made publicly available** due to privacy restrictions and non-disclosure agreements.
 
 Therefore, this repository provides **mock data (dummy data)** in the `data/` directory to demonstrate the functionality of the code.
-* The structure (column names, data types) is identical to the original data.
+* The structure (column names, data types) is identical to the original cleaned data.
 * The values are randomly generated and do not reflect actual household behaviors.
 * Please verify the code logic using this sample data.
 
@@ -42,17 +40,81 @@ Therefore, this repository provides **mock data (dummy data)** in the `data/` di
 
 ## 📂 Repository Structure
 
+The analysis is divided into 5 steps.
+
 ```text
 .
 ├── data/
-│   └── sample_data.csv      # Dummy dataset for demonstration
+│   └── sample_cleaned_data.csv # Dummy dataset (Cleaned version) for demonstration
 ├── notebooks/
-│   ├── 01_preprocessing.ipynb      # Data cleaning and preprocessing logic
-│   ├── 02_eda.ipynb                # Exploratory Data Analysis (ACF/PACF plots, etc.)
-│   ├── 03_forecasting_chronos.ipynb # Chronos model execution (recommended on Colab)
-│   ├── 04_forecasting_baseline.ipynb # Seasonal Naive baseline model
-│   ├── 05_accuracy_comparison.ipynb  # Comparison of MAE, RMSE, and MASE
-│   └── 06_essr_simulation.ipynb    # Monte Carlo Simulation for ESSR distributions
+│   ├── 01_eda.ipynb                 # Step 1: Exploratory Data Analysis (ACF/PACF, etc.)
+│   ├── 02_forecasting_chronos.ipynb # Step 2: Chronos model execution (Requires GPU)
+│   ├── 03_forecasting_baseline.ipynb # Step 3: Seasonal Naive baseline model
+│   ├── 04_accuracy_comparison.ipynb  # Step 4: Comparison of MAE, RMSE, and MASE
+│   └── 05_essr_simulation.ipynb     # Step 5: Monte Carlo Simulation for ESSR
 ├── README.md                # This file
 ├── requirements.txt         # Python dependencies
 └── LICENSE                  # MIT License
+```
+
+---
+
+## 🚀 Getting Started & Usage
+
+This project requires different environments depending on the notebook.
+
+### 1. Environment Setup
+
+#### A. Local Environment (CPU)
+Recommended for notebooks: `01`, `03`, `04`, `05`
+Use your local machine (PC) for lightweight analysis and simulations.
+
+1.  Clone the repo:
+    ```sh
+    git clone [https://github.com/YourUsername/repo-name.git](https://github.com/YourUsername/repo-name.git)
+    ```
+2.  Install dependencies:
+    ```sh
+    pip install -r requirements.txt
+    ```
+
+#### B. GPU Environment (Google Colab)
+**Required** for notebook: `02_forecasting_chronos.ipynb`
+The Chronos model requires a GPU for efficient fine-tuning and inference. We highly recommend running this notebook on **Google Colab**.
+
+* Upload `02_forecasting_chronos.ipynb` and the data file to your Google Drive or Colab environment.
+* Install necessary libraries within the notebook (commands are included in the notebook).
+
+---
+
+### 2. Running the Notebooks
+
+Please execute the notebooks in the following order:
+
+**Step 1: Exploratory Data Analysis**
+* **File**: `01_eda.ipynb` (Local CPU)
+* **Description**: Visualizes time series plots and seasonality (ACF/PACF) using the cleaned dataset.
+
+**Step 2: Forecasting with Chronos**
+* **File**: `02_forecasting_chronos.ipynb` (**GPU Required**)
+* **Description**: Fine-tunes the Chronos model and generates probabilistic forecasts (quantiles).
+* **Output**: Saves the forecast results (e.g., `chronos_forecasts.csv`) for later comparison.
+
+**Step 3: Forecasting with Baseline**
+* **File**: `03_forecasting_baseline.ipynb` (Local CPU)
+* **Description**: Generates forecasts using the Seasonal Naive (SN) approach.
+* **Output**: Saves the baseline forecast results.
+
+**Step 4: Accuracy Comparison**
+* **File**: `04_accuracy_comparison.ipynb` (Local CPU)
+* **Description**: Loads results from Step 2 and Step 3. Calculates metrics (MAE, RMSE, MASE) and visualizes the comparison (Box plots).
+
+**Step 5: ESSR Simulation**
+* **File**: `05_essr_simulation.ipynb` (Local CPU)
+* **Description**: Performs Monte Carlo Simulation using the probabilistic forecasts from Step 2 to calculate and visualize ESSR probability distributions.
+
+---
+
+## 📜 License
+
+Distributed under the MIT License. See `LICENSE` for more information.
