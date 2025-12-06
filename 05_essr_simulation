@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+
+# --------------------------------------------------------------------------------
+# --- 設定定数 ---
+# --------------------------------------------------------------------------------
+
+CHRONOS_PRED_PATH = 'chronos_forecasts.pkl'
+SIMULATION_RUNS = 1000  # MCS試行回数 (元のファイルに合わせる)
+PREDICTION_LENGTH = 12
+
+# 予測対象変数 (エネルギー供給と需要の構成要素)
+VARS_TO_SAMPLE = ['PV_gene(MJ)', 'FC_gene(MJ)', 'elect_cons(MJ)', 'gas_cons(MJ)']
+# Chronosが出力した分位レベル
+QUANTILE_LEVELS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+
+# グラフスタイルの設定
+STYLE_CONFIG = {
+    'forecast_mc': {'color': 'blue', 'label': 'Forecast (MCS)'},
+    'actual': {'color': 'red', 'label': 'Actual'},
+    'threshold': {'color': 'grey', 'linestyle': '--', 'label': 'ESSR 50% Threshold'}
+}
+
+# --------------------------------------------------------------------------------
+# --- 1. データ読み込みとMCS用のデータ整形 ---
+# --------------------------------------------------------------------------------
+
+def load_and_prepare_for_mcs(chronos_path):
+    """Chronosの予測結果を読み込み、MCSサンプリング用のデータに整形する。"""
+    
+    print(f"--- 1. Chronos予測結果の読み込み: {chronos_path} ---")
+    try:
+        df_pred = pd.read_pickle(chronos_path)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"エラー: {chronos_path} が見つかりません。")
+
+    # MCSサンプリング用のデータ構造を作成
+    # 目的: 各世帯 (ID) と各月 (timestamp) ごとに、各変数の分位点リストを取得する。
+    
+    # [ID, timestamp] のユニークな組み合わせを取得
+    unique_time_series = df_pred[['ID', 'timestamp']].drop_duplicates()
+    
+    # 結果格納用の辞書
+    sampling_data = {}
+    
+    for _, row in unique_time_series.iterrows():
+        h_id = row['ID']
+        month = row['timestamp']
+        
+        # 該当する世帯・月の分位点データ行を抽出
+        row_data = df_pred[(df_pred['ID'] == h_id) & (df_pred['timestamp'] == month)].iloc[0]
+        
+        # 変数ごとのサンプリング用分位点データを作成
+        month_samples = {}
+        for var in VARS_TO_SAMPLE:
+            # 該当変数の q10, q20, ..., q90 の値を抽出
+            quantile_values = [row_data[f'{var}_chronos_q{int(q * 100):02d}'] for q in QUANTILE_LEVELS]
+            month_samples[var] = np.array(quantile_values)
+        
+        if h_id not in sampling_data:
+            sampling_data[h_id] = {}
+        sampling_data[h_id][month] = month_samples
+        
+    print(f"✅ MCS用サンプリングデータ (全 {len(sampling_data)} 世帯) の整形が完了しました。")
+    return sampling_data
+
+# --------------------------------------------------------------------------------
+# --- 2. モンテカルロシミュレーションの実行 ---
+# --------------------------------------------------------------------------------
+
+def run_monte_carlo_simulation(sampling_data, n_runs):
+    """
+    Chronosの分位点予測を基にモンテカルロシミュレーションを実行し、
+    ESSRの確率分布を導出する。
+    
+    Args:
+        sampling_data (dict): ステップ1で整形されたサンプリング用分位点データ
+        n_runs (int): MCS試行回数
+        
+    Returns:
+        dict: 各世帯のESSRシミュレーション結果 ([n_runs]のESSR配列)
+    """
+    
+    print(f"\n--- 2. モンテカルロシミュレーション実行 (N={n_runs}) ---")
+    
+    all_household_essr_runs = {}
+    
+    # 確率密度関数(CDF)から分位点をサンプリングするための確率点
+    # QUANTILE_LEVELSは [0.10, 0.20, ..., 0.90] なので、
+    # 確率 0.00-0.10 の場合は q10 を、0.10-0.20 の場合は q20 を使用する。
+    q_points = np.array(QUANTILE_LEVELS)
+    
+    # 査読コメントで指摘された**相関の課題**をここで明記する
+    print("\nWARNING: 本シミュレーションでは、簡略化のため、ESSRの構成要素である")
+    print("         PV, FC, Elec Cons, Gas Cons の予測分布からのサンプリングは")
+    print("         **互いに独立である**と仮定しています。")
+    print("         (真のモデルでは、特にElec ConsとGas Cons間に相関が存在します。)\n")
+
+    
+    for h_id, monthly_data in sampling_data.items():
+        
+        annual_essr_simulations = np.zeros(n_runs)
+        
+        for run in range(n_runs):
+            total_pv_fc_supply = 0.0
+            total_elect_gas_demand = 0.0
+            
+            # --- 1. 各月でのサンプリング ---
+            # 予測期間（12ヶ月）の各月でサンプリングを行う
+            for month_key, month_samples in monthly_data.items():
+                
+                # 0-1の一様乱数を生成し、どの分位点レベルを代表値とするか決定
+                # (例: 0.00-0.10の乱数ならq10を使用)
+                random_p = np.random.rand() 
+                
+                # 該当する分位レベルのインデックスを特定 (例: 0.10 -> idx 0)
+                # np.searchsorted: random_pが入るべき位置を返す。
+                # 例: q_points=[0.1, 0.2, ...], random_p=0.05 -> idx=0
+                q_index = np.searchsorted(q_points, random_p, side='right')
+                
+                # 分位点リストは q10からq90の9個なので、q_indexが0-8の範囲に収まるよう調整
+                q_index = np.clip(q_index, 0, len(QUANTILE_LEVELS) - 1)
+                
+                # --- 2. 該当する分位点の値を取得 ---
+                
+                # PVとFCは供給側
+                pv_value = month_samples['PV_gene(MJ)'][q_index]
+                fc_value = month_samples['FC_gene(MJ)'][q_index]
+                
+                # 電力消費とガス消費は需要側
+                elect_cons_value = month_samples['elect_cons(MJ)'][q_index]
+                gas_cons_value = month_samples['gas_cons(MJ)'][q_index]
+                
+                # --- 3. 年間合計に加算 ---
+                total_pv_fc_supply += pv_value + fc_value
+                total_elect_gas_demand += elect_cons_value + gas_cons_value
+            
+            # --- 4. 年間ESSRの計算 ---
+            if total_elect_gas_demand > 0:
+                annual_essr_simulations[run] = total_pv_fc_supply / total_elect_gas_demand
+            else:
+                annual_essr_simulations[run] = 0.0 # 需要がゼロの場合は自給率もゼロとする
+
+        all_household_essr_runs[h_id] = annual_essr_simulations
+        
+    print("✅ 全世帯のESSRシミュレーションが完了しました。")
+    return all_household_essr_runs
+
+# --------------------------------------------------------------------------------
+# --- 3. 結果の集計と可視化 ---
+# --------------------------------------------------------------------------------
+
+def summarize_and_visualize(essr_sim_results, true_data):
+    """
+    MCS結果を集計し、ESSRの累積分布関数(CDF)をプロットする。
+    
+    Args:
+        essr_sim_results (dict): MCSによるESSRシミュレーション結果
+        true_data (pd.DataFrame): 評価期間の実績値
+    """
+    
+    print("\n--- 3. 結果の集計と可視化 ---")
+    
+    # --- A. シミュレーション結果の集計（平均ESSRと達成確率） ---
+    essr_summary = []
+    
+    for h_id, essr_runs in essr_sim_results.items():
+        
+        # 統計量の計算
+        mean_essr = np.mean(essr_runs)
+        median_essr = np.median(essr_runs)
+        std_essr = np.std(essr_runs)
+        
+        # ESSR 50%達成確率の計算
+        prob_50_percent = np.mean(essr_runs >= 0.5)
+        
+        # 実績ESSRの計算 (実績データが必要)
+        actual_data = true_data[true_data['ID'] == h_id]
+        if not actual_data.empty:
+            actual_supply = actual_data['PV_gene(MJ)'].sum() + actual_data['FC_gene(MJ)'].sum()
+            actual_demand = actual_data['elect_cons(MJ)'].sum() + actual_data['gas_cons(MJ)'].sum()
+            actual_essr = actual_supply / actual_demand if actual_demand > 0 else 0.0
+        else:
+            actual_essr = np.nan
+        
+        essr_summary.append({
+            'ID': h_id,
+            'Actual ESSR': actual_essr,
+            'Forecast Mean ESSR': mean_essr,
+            'Prob(ESSR >= 50%)': prob_50_percent,
+            'ESSR Std Dev': std_essr,
+            'ESSR 10th Percentile': np.percentile(essr_runs, 10)
+        })
+        
+    df_essr_summary = pd.DataFrame(essr_summary).set_index('ID')
+    
+    print("\n--- ESSRシミュレーション結果 (各世帯) ---")
+    display(df_essr_summary.head())
+    
+    # --- B. 全世帯のESSR分布プロット (CDF) ---
+    
+    # 1. 全シミュレーション結果（全世帯をフラット化）
+    all_runs_flat = np.concatenate(list(essr_sim_results.values()))
+    
+    # 2. 全世帯の実績ESSR（CDF比較用）
+    # 年間ESSRを世帯ごとに計算し、その値の分布を取得
+    df_true_annual_summary = true_data.groupby('ID').agg({
+        'PV_gene(MJ)': 'sum', 'FC_gene(MJ)': 'sum',
+        'elect_cons(MJ)': 'sum', 'gas_cons(MJ)': 'sum'
+    })
+    df_true_annual_summary['Actual_ESSR'] = (
+        df_true_annual_summary['PV_gene(MJ)'] + df_true_annual_summary['FC_gene(MJ)']
+    ) / (
+        df_true_annual_summary['elect_cons(MJ)'] + df_true_annual_summary['gas_cons(MJ)']
+    )
+    all_actual_essr = df_true_annual_summary['Actual_ESSR'].values
+    
+    # グラフ描画
+    PERCENT_FORMATTER = PercentFormatter(xmax=1, decimals=0)
+    
+    plt.figure(figsize=(8, 6))
+    
+    # 予測ESSRのCDF
+    sns.ecdfplot(all_runs_flat, color=STYLE_CONFIG['forecast_mc']['color'], 
+                 linestyle='-', linewidth=2, label=STYLE_CONFIG['forecast_mc']['label'], alpha=0.8)
+    
+    # 実績ESSRのCDF (これは世帯数 N のステップ関数となる)
+    sns.ecdfplot(all_actual_essr, color=STYLE_CONFIG['actual']['color'], 
+                 linestyle='--', linewidth=2, label=STYLE_CONFIG['actual']['label'], alpha=0.8)
+
+    # グラフ装飾 (英語化)
+    plt.xlabel('Annual Energy Self-Sufficiency Ratio (ESSR)', fontsize=12)
+    plt.ylabel('Cumulative Share of Households', fontsize=12)
+    
+    # ZEH/ESSR 50% 閾値
+    plt.axvline(0.5, color=STYLE_CONFIG['threshold']['color'], linestyle='--', linewidth=1, label='ESSR 50%')
+    
+    # 軸のフォーマットをパーセンテージに
+    plt.gca().xaxis.set_major_formatter(PERCENT_FORMATTER)
+    plt.gca().yaxis.set_major_formatter(PERCENT_FORMATTER)
+    plt.xlim(0, 1.0); plt.ylim(0, 1.01)
+    
+    plt.legend(loc='best')
+    plt.title('CDF of Annual ESSR (Forecast vs. Actual) for All Households', fontsize=14)
+    plt.show()
+    
+    # --- C. 結果の保存 ---
+    df_essr_summary.to_pickle("essr_simulation_summary.pkl")
+    print("\n✅ ESSRシミュレーション結果が 'essr_simulation_summary.pkl' に保存されました。")
+
+# --------------------------------------------------------------------------------
+# --- メイン処理 ---
+# --------------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    try:
+        # MCS用サンプリングデータの準備
+        sampling_data = load_and_prepare_for_mcs(CHRONOS_PRED_PATH)
+        
+        # MCS実行
+        essr_sim_results = run_monte_carlo_simulation(sampling_data, SIMULATION_RUNS)
+        
+        # 実績データも再度読み込み（ESSR実績値の比較用）
+        temp_df = load_and_preprocess_data(CSV_FILE_NAME)
+        df_true_eval = temp_df[
+            (temp_df['timestamp'] >= EVAL_START_DATE) & (temp_df['timestamp'] <= EVAL_END_DATE)
+        ].copy()
+        
+        # 集計と可視化
+        summarize_and_visualize(essr_sim_results, df_true_eval)
+        
+        print("\n=== ESSRシミュレーションとエラーチェックが完了しました。===")
+    
+    except FileNotFoundError as e:
+        print(f"\n致命的なエラーが発生しました: {e}")
+        print("Chronos予測結果ファイルが存在するか確認してください。")
+    except Exception as e:
+        print(f"\n致命的なエラーが発生しました: {e}")
+        print("=== ESSRシミュレーションの実行中にエラーが発生しました。===")
