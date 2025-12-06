@@ -45,11 +45,11 @@ The analysis is divided into 5 steps.
 ```text
 .
 ├── sample_cleaned_data.csv # Dummy dataset (Cleaned version) for demonstration
-├── 01_eda.ipynb                 # Step 1: Exploratory Data Analysis (ACF/PACF, etc.)
-├── 02_forecasting_chronos.ipynb # Step 2: Chronos model execution (Requires GPU)
-├── 03_forecasting_baseline.ipynb # Step 3: Seasonal Naive baseline model
-├── 04_accuracy_comparison.ipynb  # Step 4: Comparison of MAE, RMSE, and MASE
-├── 05_essr_simulation.ipynb     # Step 5: Monte Carlo Simulation for ESSR
+├── 01_eda.py                 # Step 1: Exploratory Data Analysis (ACF/PACF, etc.)
+├── 02_forecasting_chronos.py # Step 2: Chronos model execution (Requires GPU)
+├── 03_forecasting_baseline.py # Step 3: Seasonal Naive baseline model
+├── 04_accuracy_comparison.py  # Step 4: Comparison of MAE, RMSE, and MASE
+├── 05_essr_simulation.py     # Step 5: Monte Carlo Simulation for ESSR
 ├── README.md                # This file
 ├── requirements.txt         # Python dependencies
 └── LICENSE                  # MIT License
