@@ -1,0 +1,306 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --------------------------------------------------------------------------------
+# --- 設定定数 ---
+# --------------------------------------------------------------------------------
+
+CSV_FILE_NAME = 'sample_cleaned_data.csv'
+SN_PRED_PATH = 'sn_predictions.pkl'
+CHRONOS_PRED_PATH = 'chronos_forecasts.pkl'
+
+# 単位変換係数 (MASE計算のために、元の30分データを再処理する)
+KWH_TO_MJ = 3.6
+M3_TO_MJ = 45.0 
+
+# 評価対象期間 (テスト期間)
+EVAL_START_DATE = '2023-04'
+EVAL_END_DATE = '2024-03'
+
+TARGET_COLUMNS = [
+    'PV_gene(MJ)', 
+    'FC_gene(MJ)', 
+    'elect_cons(MJ)', 
+    'gas_cons(MJ)'
+]
+
+# --------------------------------------------------------------------------------
+# --- 1. データ読み込みと結合 ---
+# --------------------------------------------------------------------------------
+
+def load_data_and_merge(csv_file, sn_path, chronos_path):
+    
+    print("--- 1-1. 全実績データの読み込みと前処理 ---")
+    try:
+        # NOTE: MASE計算のために、生の30分データ（CSV）から日次/月次差分を計算
+        original_df = pd.read_csv(csv_file, parse_dates=['datetime'])
+        original_df.set_index('datetime', inplace=True)
+        
+        # 月次・MJ単位への前処理を再現 (必要な列のみ抽出)
+        df = original_df[['ID'] + [col.replace('(MJ)', '(kWh)').replace('(m3)', '(m3)') for col in TARGET_COLUMNS] + ['temp', 'WNDSPD', 'RHUM', 'PRCRIN_30MIN', 'GLBRAD_30MIN']]
+        
+        # IDごとにグループ化し，月次合計にリサンプリング
+        df_monthly = df.groupby('ID').resample('MS').sum().reset_index(level='ID')
+        
+        # 単位変換
+        for col in [c for c in df_monthly.columns if '(kWh)' in c]:
+            df_monthly[col] = df_monthly[col] * KWH_TO_MJ
+        for col in [c for c in df_monthly.columns if '(m3)' in c]:
+            df_monthly[col] = df_monthly[col] * M3_TO_MJ
+        
+        # 列名をMJ単位に修正
+        df_monthly.columns = [col.replace('(kWh)', '(MJ)').replace('(m3)', '(MJ)') for col in df_monthly.columns]
+        
+        # timestamp列を 'YYYY-MM' 文字列に変換
+        df_monthly.reset_index(names=['timestamp'], inplace=True)
+        df_monthly['timestamp'] = df_monthly['timestamp'].dt.strftime('%Y-%m')
+        
+        # 評価期間の実績値のみを抽出
+        df_true = df_monthly[
+            (df_monthly['timestamp'] >= EVAL_START_DATE) & (df_monthly['timestamp'] <= EVAL_END_DATE)
+        ].copy()
+        
+        print(f"実績データ（評価期間）サイズ: {df_true.shape}")
+        
+    except Exception as e:
+        print(f"エラー: 実績データの読み込み中にエラーが発生しました。: {e}")
+        return pd.DataFrame()
+
+
+    # --- 1-2. 予測結果の読み込みと結合 ---
+    try:
+        print(f"--- 1-2. {SN_PRED_PATH} と {CHRONOS_PRED_PATH} を読み込み ---")
+        df_sn = pd.read_pickle(sn_path)
+        df_chronos = pd.read_pickle(chronos_path)
+    except FileNotFoundError as e:
+        print(f"エラー: 予測ファイルが見つかりません。前ステップの実行を確認してください: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"エラー: 予測ファイルの読み込み中にエラーが発生しました: {e}")
+        return pd.DataFrame()
+
+    # --- 1-3. 結合 ---
+    # 実績値とSN予測値を結合
+    combined_df = pd.merge(df_true, df_sn, on=['ID', 'timestamp'], how='inner')
+    
+    # Chronos予測値を結合 (分位点予測を含む)
+    combined_df = pd.merge(combined_df, df_chronos, on=['ID', 'timestamp'], how='inner')
+    
+    # 最終的な評価データフレームの確認
+    print(f"✅ 予測結果と実績値の結合が完了しました。データサイズ: {combined_df.shape}")
+    return combined_df
+
+# --------------------------------------------------------------------------------
+# --- 2. 評価指標の計算ヘルパー関数 ---
+# --------------------------------------------------------------------------------
+
+def calculate_mape_and_mape(y_true, y_pred):
+    """MAEとRMSEを計算する"""
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = mean_squared_error(y_true, y_pred, squared=False)
+    return mae, rmse
+
+def calculate_mase(y_true, y_pred, y_baseline_hist):
+    """
+    MASE (Mean Absolute Scaled Error) を計算する．
+    
+    Args:
+        y_true (np.array): 実績値 (評価期間)
+        y_pred (np.array): 提案モデルの予測値 (評価期間)
+        y_baseline_hist (np.array): 過去の基準予測誤差のベース (例: 12ヶ月前の実測値)
+        
+    Returns:
+        float: MASE値 (提案モデルのMAE / 基準モデルのMAE)
+    """
+    # 基準モデル: Naive (1ヶ月ラグ) のMAEを分母とする
+    # y_baseline_hist は、実績値 (y_true) と同じ長さであり、
+    # y_true[t] と y_true[t-1] の絶対差分を使用します。
+    # ここでは、前処理後のデータが月次データであり、その月次データ全体の過去差分を使用します。
+    
+    # 1. 提案モデルのMAE (分子)
+    mae_proposed = mean_absolute_error(y_true, y_pred)
+    
+    # 2. 基準モデル（Naive/1-step lag）のMAE (分母)
+    # y_baseline_histは評価期間（12ヶ月）のデータ。
+    # Naive予測（前月の値）の誤差：y_true[t] - y_true[t-1]
+    # 時系列の最初の値は前の値がないため、2番目以降のデータを使用する。
+    
+    # 過去の実績値の絶対差分（分子の平均）
+    abs_diff_baseline = np.abs(y_baseline_hist[1:] - y_baseline_hist[:-1])
+    # 最初の1ヶ月の差分がないため、平均はN-1で割る (Nは評価期間の長さ)
+    mae_baseline = np.mean(abs_diff_baseline)
+    
+    # 3. MASEの計算
+    if mae_baseline == 0:
+        return 999.0 # ゼロ割を避ける
+    return mae_proposed / mae_baseline
+
+
+# --------------------------------------------------------------------------------
+# --- 3. 確率的予測の評価 (PICP) ---
+# --------------------------------------------------------------------------------
+
+def calculate_picp(df, var_name, nominal_coverage=0.80):
+    """
+    PICP (Prediction Interval Coverage Probability) を計算する．
+    
+    Args:
+        df (pd.DataFrame): 実績値と分位点予測値を含むDataFrame
+        var_name (str): 評価対象変数名 (例: 'PV_gene(MJ)')
+        nominal_coverage (float): 名目的なカバレッジレベル (例: 0.80)
+    """
+    lower_q = f"{var_name}_chronos_q{int((1 - nominal_coverage) / 2 * 100):02d}"  # 例: q10
+    upper_q = f"{var_name}_chronos_q{int((1 + nominal_coverage) / 2 * 100):02d}"  # 例: q90
+    
+    # 必要な列が存在するか確認
+    if not all(col in df.columns for col in [var_name, lower_q, upper_q]):
+        return None
+        
+    # 実績値が予測区間内にあるか (True/False)
+    df['is_covered'] = (df[var_name] >= df[lower_q]) & (df[var_name] <= df[upper_q])
+    
+    # カバレッジ率 (Trueの割合) を計算
+    picp = df['is_covered'].mean()
+    
+    return picp
+
+# --------------------------------------------------------------------------------
+# --- 4. メイン処理 ---
+# --------------------------------------------------------------------------------
+
+def main():
+    
+    # 全世帯・全モデル予測を結合した評価用DataFrame
+    combined_evaluation_df = load_data_and_merge(CSV_FILE_NAME, SN_PRED_PATH, CHRONOS_PRED_PATH)
+    
+    if combined_evaluation_df.empty:
+        return
+
+    # MASE計算用の過去実績値 (評価期間のデータ) を準備
+    # MASEの分母として使用する、Naive (1-step lag) のMAEを計算するために必要
+    
+    # 評価期間の実績値のみを抽出
+    true_data_eval = combined_evaluation_df[['ID', 'timestamp'] + TARGET_COLUMNS].copy()
+    
+    # MASEを計算するための過去データ (評価期間の前の期間)
+    # 2022-04 ~ 2023-03 の実績値 + 評価期間の最初の月 (2023-04) が必要
+    df_raw = load_data_and_merge(CSV_FILE_NAME, SN_PRED_PATH, CHRONOS_PRED_PATH)
+    
+    # 評価期間とFT期間の最終月を含むデータ (MASE計算の分母のベース)
+    mase_base_df = df_raw[
+        (df_raw['timestamp'] >= '2022-03') & (df_raw['timestamp'] <= EVAL_END_DATE)
+    ].copy()
+    
+    # --- A. 点予測指標の計算 (MAE, RMSE, MASE) ---
+    print("\n--- A. 点予測指標の計算 (MAE, RMSE, MASE) ---")
+    
+    # 結果格納用
+    point_metrics_results = []
+    
+    for id_value, group_df in combined_evaluation_df.groupby('ID'):
+        
+        household_metrics = {'ID': id_value}
+        
+        # MASE計算用の過去実績値 (2022-03から評価期間終了月までの実績データ)
+        mase_group_base = mase_base_df[mase_base_df['ID'] == id_value].sort_values(by='timestamp')
+        
+        for col in TARGET_COLUMNS:
+            y_true = group_df[col].values
+            
+            # --- 1. SN (Seasonal Naive) の評価 ---
+            y_pred_sn = group_df[f'{col}_sn_pred'].values
+            mae_sn, rmse_sn = calculate_mape_and_mape(y_true, y_pred_sn)
+            
+            # MASEの分母に使用する過去実績値 (評価期間の実績値全体)
+            # 論文の定義に基づき、この履歴データ全体の1期ラグMAEを分母とする
+            y_baseline_hist = mase_group_base[col].values 
+            mase_sn = calculate_mase(y_true, y_pred_sn, y_baseline_hist)
+            
+            household_metrics[f'{col}_MAE_SN'] = mae_sn
+            household_metrics[f'{col}_RMSE_SN'] = rmse_sn
+            household_metrics[f'{col}_MASE_SN'] = mase_sn
+            
+            # --- 2. Chronos の評価 ---
+            y_pred_chr = group_df[f'{col}_chronos_pred'].values
+            mae_chr, rmse_chr = calculate_mape_and_mape(y_true, y_pred_chr)
+            mase_chr = calculate_mase(y_true, y_pred_chr, y_baseline_hist)
+            
+            household_metrics[f'{col}_MAE_CHRONOS'] = mae_chr
+            household_metrics[f'{col}_RMSE_CHRONOS'] = rmse_chr
+            household_metrics[f'{col}_MASE_CHRONOS'] = mase_chr
+            
+        point_metrics_results.append(household_metrics)
+        
+    df_point_metrics = pd.DataFrame(point_metrics_results).set_index('ID')
+    
+    # 全世帯平均の計算と表示
+    mean_metrics = df_point_metrics.mean().rename('Average')
+    df_metrics_summary = pd.concat([df_point_metrics, mean_metrics.to_frame().T])
+    
+    print("\n--- 点予測指標 (全世帯平均) ---")
+    display(df_metrics_summary.loc[['Average']].T)
+    
+    # --- B. 確率的予測の評価 (PICP) ---
+    
+    print("\n--- B. 確率的予測指標の計算 (PICP) ---")
+    
+    coverage_results = {}
+    nominal_coverage = 0.80 # q10-q90の区間
+    
+    for col in TARGET_COLUMNS:
+        # 全データ（全世帯 x 12ヶ月）を対象にPICPを計算
+        picp = calculate_picp(combined_evaluation_df, col, nominal_coverage=nominal_coverage)
+        
+        if picp is not None:
+             coverage_results[col] = {
+                'Nominal_Coverage (%)': nominal_coverage * 100,
+                'Actual_Coverage (%)': picp * 100
+            }
+            
+    df_coverage = pd.DataFrame.from_dict(coverage_results, orient='index')
+    df_coverage['Difference (Actual - Nominal) %'] = df_coverage['Actual_Coverage (%)'] - df_coverage['Nominal_Coverage (%)']
+    
+    print("\nChronos 80%信頼区間 (q10-q90) のカバレッジ率:")
+    display(df_coverage)
+    
+    
+    # --- C. 結果の保存と箱ひげ図の描画（確認用） ---
+    
+    # 評価結果の保存
+    df_metrics_summary.to_pickle("evaluation_summary_metrics.pkl")
+    print(f"\n✅ 評価サマリーが 'evaluation_summary_metrics.pkl' に保存されました。")
+    
+    # 箱ひげ図の描画
+    df_mase = df_point_metrics[[col for col in df_point_metrics.columns if '_MASE' in col]]
+    
+    # 列名の整形: '_MASE_CHRONOS' -> 'Chronos', '_MASE_SN' -> 'SN'
+    df_mase_plot = pd.DataFrame()
+    for col in TARGET_COLUMNS:
+        df_mase_plot[f'{col}_Chronos'] = df_mase[f'{col}_MASE_CHRONOS']
+        df_mase_plot[f'{col}_SN'] = df_mase[f'{col}_MASE_SN']
+        
+    plt.figure(figsize=(12, 6))
+    
+    # PVとそれ以外のMAE分布を比較
+    for i, col in enumerate(TARGET_COLUMNS):
+        plt.subplot(1, len(TARGET_COLUMNS), i + 1)
+        
+        plot_data = df_mase_plot[[f'{col}_Chronos', f'{col}_SN']].melt(var_name='Model', value_name='MASE')
+        
+        sns.boxplot(x='Model', y='MASE', data=plot_data, palette=['skyblue', 'lightcoral'])
+        plt.title(f'MASE - {col.split("(", 1)[0]}', fontsize=12)
+        plt.xlabel('')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.ylim(0, max(plot_data['MASE'].max() * 1.1, 1.5)) # MASE=1.0を基準にプロット
+        plt.axhline(1.0, color='gray', linestyle='--', linewidth=1) # MASE=1.0のライン
+        
+    plt.suptitle('MASE Distribution Comparison: Chronos vs Seasonal Naive (m=12)', fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == '__main__':
+    main()
