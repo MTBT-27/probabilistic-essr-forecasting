@@ -6,23 +6,18 @@ from sklearn.metrics import mean_absolute_error
 from datetime import timedelta
 
 # --------------------------------------------------------------------------------
-# --- 依存関係のインストールと環境設定 ---
+# --- Environment Setup and Dependencies ---
 # --------------------------------------------------------------------------------
-# 査読者注: このスクリプトがJupyter/Colab環境で実行される場合、以下のpipコマンドで
-# 必要なライブラリをインストールする必要があります。
+# Reviewer Note: If this script is run in a Jupyter/Colab environment, 
+# the following pip command may be needed to install the required libraries.
 # %pip install 'chronos-forecasting>=2.0' 'pandas[pyarrow]' 'matplotlib'
 
-# Chronosパイプラインのインポートとロード（GPU推奨）
+# Import and Load the Chronos Pipeline (GPU recommended)
 try:
-    # Chronosライブラリは通常、外部環境（Colab/GPU）で実行されます。
-    # ここでは、ライブラリが利用可能であることを前提とします。
+    # Assuming Chronos library is available.
     from chronos import BaseChronosPipeline, Chronos2Pipeline
 
-    # NOTE: 本環境ではGPU/Hugging Faceのモデルロードは実行できないため、
-    # 実際にはコメントアウトするか、外部環境で実行してください。
-    # pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained("amazon/chronos-2", device_map="cuda")
-    
-    # ダミーパイプラインを定義し、エラー回避（学習と予測はダミー関数で代替）
+    # Define a Dummy Pipeline to avoid errors when running without a GPU/Hugging Face model load
     class DummyChronosPipeline:
         def fit(self, inputs, prediction_length, num_steps, learning_rate, batch_size, logging_steps):
             print("INFO: Skipping Chronos model fitting (Fine-tuning)")
@@ -31,7 +26,7 @@ try:
         def predict_quantiles(self, inputs, prediction_length, quantile_levels):
             print(f"INFO: Simulating prediction for {len(inputs)} households...")
             
-            # ダミーの予測結果を生成
+            # Generate dummy prediction results
             quantiles_list = []
             mean_list = []
             
@@ -39,16 +34,16 @@ try:
                 target = input_data["target"]
                 num_variates, history_length = target.shape
                 
-                # 予測は履歴の最終値をそのまま繰り返す簡易モデルとしてシミュレート
-                # 形状: (num_variates, prediction_length)
+                # Simulate prediction as a simple model repeating the last historical value
+                # Shape: (num_variates, prediction_length)
                 mean_pred = np.tile(target[:, -1].reshape(-1, 1), prediction_length)
                 
-                # 分位予測は平均値にノイズを加える形でシミュレート
-                # 形状: (num_variates, prediction_length, num_quantiles)
+                # Simulate quantile prediction by adding noise to the mean
+                # Shape: (num_variates, prediction_length, num_quantiles)
                 num_quantiles = len(quantile_levels)
                 quant_pred = np.stack([mean_pred * (1 + (q - 0.5) * 0.2) for q in quantile_levels], axis=-1)
                 
-                # PyTorchのTensorを返却する形式を模倣
+                # Mimic returning PyTorch Tensors
                 class DummyTensor:
                     def __init__(self, data):
                         self.data = data
@@ -61,11 +56,11 @@ try:
             return quantiles_list, mean_list
 
     pipeline = DummyChronosPipeline()
-    print("✅ Dummy Chronos Pipeline がロードされました (エラー回避ロジック)。")
+    print("✅ Dummy Chronos Pipeline loaded (Error-avoidance logic).")
 
 except ImportError:
-    # chronosがインストールされていない環境向けのエラー回避
-    print("WARNING: chronos-forecasting が利用できません。処理をスキップします。")
+    # Error avoidance for environments where chronos is not installed
+    print("WARNING: chronos-forecasting is not available. Skipping processing.")
     class DummyChronosPipeline:
         def fit(self, *args, **kwargs):
             return self
@@ -74,21 +69,21 @@ except ImportError:
     pipeline = DummyChronosPipeline()
 
 # --------------------------------------------------------------------------------
-# --- 共通関数：データ抽出と整形 ---
+# --- Utility Functions: Data Extraction and Shaping ---
 # --------------------------------------------------------------------------------
 
 CSV_FILE_NAME = 'sample_cleaned_data.csv'
 
 def load_and_preprocess_data(file_name):
-    """CSVを読み込み、月次・MJ単位への変換と整形を行う。"""
+    """Loads CSV, converts to monthly/MJ units, and reshapes."""
     
     try:
         df = pd.read_csv(file_name, parse_dates=['datetime'])
         df.set_index('datetime', inplace=True)
     except FileNotFoundError:
-        raise FileNotFoundError(f"エラー: {file_name} が見つかりません。")
+        raise FileNotFoundError(f"Error: {file_name} not found.")
 
-    # --- (A) 月次データへの変換と単位変換 ---
+    # --- (A) Monthly Aggregation and Unit Conversion ---
     KWH_TO_MJ = 3.6
     M3_TO_MJ = 45.0
     KWH_COLUMNS = ["elect_purchase(kWh)", "elect_sale(kWh)", "PV_gene(kWh)", "FC_gene(kWh)", "elect_cons(kWh)"]
@@ -99,24 +94,26 @@ def load_and_preprocess_data(file_name):
         "elect_cons(kWh)": "elect_cons(MJ)", "gas_cons(m3)": "gas_cons(MJ)"
     }
     
-    # IDごとにグループ化し，月次合計にリサンプリング
-    # HEMSデータと気象データを分離して集計
+    # Separate HEMS and weather data for aggregation
     hems_cols_raw = [col for col in KWH_COLUMNS + M3_COLUMNS if col in df.columns]
     weather_cols_raw = ['temp', 'WNDSPD', 'RHUM', 'PRCRIN_30MIN', 'GLBRAD_30MIN']
 
+    # Group by ID and resample to monthly sum for HEMS data
     hems_monthly = df.groupby('ID')[hems_cols_raw].resample('MS').sum().reset_index(level='ID')
     
-    # 単位変換
+    # Unit Conversion
     for col in [c for c in KWH_COLUMNS if c in hems_monthly.columns]:
         hems_monthly[col] = hems_monthly[col] * KWH_TO_MJ
     for col in [c for c in M3_COLUMNS if c in hems_monthly.columns]:
         hems_monthly[col] = hems_monthly[col] * M3_TO_MJ
     hems_monthly.rename(columns=RENAME_MAPPING, inplace=True)
 
-    # --- (B) 気象データの月次集計 ---
+    # --- (B) Monthly Aggregation for Weather Data ---
+    # Group by index (datetime) and take first value to remove ID dependency
     weather_data_raw = df.groupby(df.index).first()[weather_cols_raw]
     weather_agg_methods = {'temp': 'mean', 'WNDSPD': 'mean', 'RHUM': 'mean', 'PRCRIN_30MIN': 'sum', 'GLBRAD_30MIN': 'sum'}
     weather_monthly_df = weather_data_raw.resample('MS').agg(weather_agg_methods)
+    
     WEATHER_RENAME_MAPPING = {
         'temp': 'Monthly_Avg_Temp', 'WNDSPD': 'Monthly_Avg_WindSpeed', 
         'RHUM': 'Monthly_Avg_RelHumidity', 'PRCRIN_30MIN': 'Monthly_Total_Precipitation', 
@@ -124,23 +121,23 @@ def load_and_preprocess_data(file_name):
     }
     weather_monthly_df.rename(columns=WEATHER_RENAME_MAPPING, inplace=True)
     
-    # --- (C) マージと最終整形 ---
+    # --- (C) Merge and Final Shaping ---
     processed_df = hems_monthly.merge(weather_monthly_df, left_index=True, right_index=True, how='left')
     processed_df.dropna(inplace=True)
     processed_df.reset_index(names=['timestamp'], inplace=True)
     
     return processed_df
 
-# Chronosの入力形式 (Numpy配列) に整形するヘルパー関数
+# Helper function to shape data into Chronos input format (Numpy array)
 def create_chronos_array(df, household_id, start_date, end_date, columns, is_target=True):
     """
-    Chronosのtarget (2D array: [variates, history_length]) または
-    past_covariates/future_covariates (dict: {col: 1D array}) 形式のデータを作成する。
+    Creates data in the Chronos target (2D array: [variates, history_length]) or
+    past_covariates/future_covariates (dict: {col: 1D array}) format.
     """
     
     df_household = df[df['ID'] == household_id].copy()
 
-    # 期間でフィルタリング (start_date <= timestamp <= end_date)
+    # Filter by period (start_date <= timestamp <= end_date)
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
     df_period = df_household[
@@ -155,49 +152,49 @@ def create_chronos_array(df, household_id, start_date, end_date, columns, is_tar
         return (np.array([[]]), 0) if is_target else ({}, 0)
 
     if is_target:
-        # target形式: (num_variates, history_length)
+        # target format: (num_variates, history_length)
         target_array = df_selected.values.T
         return target_array, history_length
     else:
-        # covariate形式: {col_name: 1D_array}
+        # covariate format: {col_name: 1D_array}
         covariates_dict = {col: df_selected[col].values for col in columns}
         return covariates_dict, history_length
 
 # --------------------------------------------------------------------------------
-# --- 予測実行ロジック ---
+# --- Forecasting Execution Logic ---
 # --------------------------------------------------------------------------------
 
 def run_chronos_forecasting(pipeline, df):
     
-    # === 設定定数 ===
+    # === Configuration Constants ===
     HOUSEHOLD_ID_LIST = df['ID'].unique().tolist()
-    # ファインチューニング期間: 2021-01 から 2023-03 (27ヶ月)
+    # Fine-tuning period: Jan 2021 to Mar 2023 (27 months)
     FT_START_DATE = '2021-01'
     FT_END_DATE = '2023-03'
-    # 予測期間 (テスト期間): 2023-04 から 2024-03 (12ヶ月)
+    # Prediction period (Test period): Apr 2023 to Mar 2024 (12 months)
     PRED_START_DATE = '2023-04'
     PRED_END_DATE = '2024-03'
     PREDICTION_LENGTH = 12
     
-    # 予測対象変数 (ターゲット)
+    # Target variables for prediction
     TARGET_COLUMNS = ['PV_gene(MJ)', 'FC_gene(MJ)', 'elect_cons(MJ)', 'gas_cons(MJ)']
     
-    # 共変量 (過去の実績データや気象データ)
+    # Past covariates (Historical and weather data)
     PAST_COVARIATES = [
         'elect_purchase(MJ)', 'elect_sale(MJ)', 
         'Monthly_Avg_Temp', 'Monthly_Avg_WindSpeed', 'Monthly_Avg_RelHumidity',
         'Monthly_Total_Precipitation', 'Monthly_Total_GlobalRad'
     ]
-    # ==================\n
+    # ===============================
     
-    # 1. ファインチューニング用データの準備 (複数の世帯をまとめたリスト)
+    # 1. Prepare Fine-Tuning Data (List combining multiple households)
     ft_inputs_list = []
     
-    print("\n--- 1. ファインチューニング用データの準備 ---")
+    print("\n--- 1. Preparing Fine-Tuning Data ---")
     for h_id in HOUSEHOLD_ID_LIST:
-        # ターゲットデータ（実績値）の準備: 2021-01 ~ 2023-03
+        # Prepare target data (actual values): Jan 2021 ~ Mar 2023
         ft_target_df, ft_len = create_chronos_array(df, h_id, FT_START_DATE, FT_END_DATE, TARGET_COLUMNS, is_target=True)
-        # 過去の共変量（気象データなど）の準備: 2021-01 ~ 2023-03
+        # Prepare past covariates (e.g., weather data): Jan 2021 ~ Mar 2023
         ft_past_cov_dict, _ = create_chronos_array(df, h_id, FT_START_DATE, FT_END_DATE, PAST_COVARIATES, is_target=False)
 
         if ft_len > 0:
@@ -208,44 +205,40 @@ def run_chronos_forecasting(pipeline, df):
                 }
             )
         else:
-            print(f"WARNING: 世帯ID {h_id} のファインチューニング用データがありません。")
+            print(f"WARNING: No fine-tuning data available for Household ID {h_id}.")
 
-    print(f"✅ ファインチューニング準備完了: {len(ft_inputs_list)} 世帯分のデータを統合しました。")
+    print(f"✅ Fine-tuning data preparation complete: Integrated data for {len(ft_inputs_list)} households.")
 
-    # 2. モデルのファインチューン (合同学習/プールドトレーニング)
+    # 2. Fine-Tune the Model (Pooled Training)
     finetuned_pipeline = pipeline.fit(
         inputs=ft_inputs_list,
         prediction_length=PREDICTION_LENGTH,
-        num_steps=50,  # デモとエラー回避のため、ステップ数を少なく設定
+        num_steps=50,  # Set a low number of steps for demo/error avoidance
         learning_rate=5e-6,
         batch_size=4,
         logging_steps=10,
     )
-    print("\n✅ モデルのファインチューニングが完了しました。")
+    print("\n✅ Model fine-tuning completed.")
 
-    # 3. 予測用データの準備と一括予測
+    # 3. Prepare Prediction Data and Execute Batch Prediction
     pred_inputs_list = []
     
-    print("\n--- 3. 予測用データの準備と予測実行 ---")
-    # 予測の「コンテキスト期間」を定義します。Chronosは通常、予測期間と同じ長さの履歴を最小限必要とします。
-    # ここではFT期間の最終12ヶ月をコンテキストとして使用します。
-    # コンテキスト開始日: FT_END_DATEから12ヶ月前 ('2022-04')
-    CONTEXT_START_DATE = (pd.to_datetime(FT_END_DATE) - pd.DateOffset(months=PREDICTION_LENGTH-1)).strftime('%Y-%m')
+    print("\n--- 3. Preparing Prediction Data and Executing Prediction ---")
+    # Define the 'context period'. Chronos generally requires a minimum history length
+    # equal to the prediction length.
+    # Context Start Date: 12 months before FT_END_DATE ('Apr 2022')
+    CONTEXT_START_DATE = (pd.to_datetime(FT_END_DATE) - pd.DateOffset(months=PREDICTION_LENGTH - 1)).strftime('%Y-%m')
     CONTEXT_END_DATE = FT_END_DATE
     
     for h_id in HOUSEHOLD_ID_LIST:
-        # ターゲットデータ（履歴）の準備: 2022-04 ~ 2023-03
+        # Prepare target data (history/context): Apr 2022 ~ Mar 2023
         context_target_df, context_len = create_chronos_array(df, h_id, CONTEXT_START_DATE, CONTEXT_END_DATE, TARGET_COLUMNS, is_target=True)
-        # 過去の共変量（コンテキスト期間）の準備
+        # Prepare past covariates (context period)
         context_past_cov_dict, _ = create_chronos_array(df, h_id, CONTEXT_START_DATE, CONTEXT_END_DATE, PAST_COVARIATES, is_target=False)
         
-        # 将来の共変量（予測期間の気象データなど）の準備: 2023-04 ~ 2024-03
-        # NOTE: 論文では将来の共変量として elect_purchase/elect_sale も使用されていますが、
-        # これらの値は予測期間では「未知」となるため、ここでは将来の予測タスクに必要な
-        # Monthly_Avg_Temp, Monthly_Total_GlobalRad のような「既知の将来の値」のみを
-        # future_covariatesとして使用することを推奨しますが、元の添付コードに従い、
-        # ここではpast_covariatesのみを使用する構造を維持し、将来共変量は空とします。
-
+        # Future covariates (e.g., weather data for prediction period) are omitted 
+        # in this structure, maintaining the original implementation's focus on past_covariates only.
+        
         if context_len == PREDICTION_LENGTH:
             pred_inputs_list.append(
                 {
@@ -254,9 +247,9 @@ def run_chronos_forecasting(pipeline, df):
                 }
             )
         else:
-             print(f"WARNING: 世帯ID {h_id} のコンテキスト期間のデータ長 ({context_len}) が {PREDICTION_LENGTH} に満たないため予測をスキップします。")
+            print(f"WARNING: Context period data length ({context_len}) for Household ID {h_id} is less than {PREDICTION_LENGTH}. Skipping prediction.")
 
-    # 4. 各世帯の一括予測を実行 (9個の分位レベル)
+    # 4. Execute Batch Prediction for all Households (9 quantile levels)
     QUANTILE_LEVELS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
     
     quantiles_list, mean_list = finetuned_pipeline.predict_quantiles(
@@ -265,16 +258,16 @@ def run_chronos_forecasting(pipeline, df):
         quantile_levels=QUANTILE_LEVELS
     )
     
-    print(f"\n✅ 全 {len(pred_inputs_list)} 世帯に対する予測が完了しました。")
+    print(f"\n✅ Prediction completed for all {len(pred_inputs_list)} households.")
     
-    # 5. 結果の整形と保存
+    # 5. Reshape and Save Results
     all_preds_list = []
     
-    # 予測期間のタイムスタンプを生成
+    # Generate timestamps for the prediction period
     pred_start_dt = pd.to_datetime(PRED_START_DATE)
     forecast_periods = pd.period_range(start=pred_start_dt.to_period('M'), periods=PREDICTION_LENGTH, freq='M').strftime('%Y-%m')
 
-    # 最終予測結果の列順序を定義
+    # Define the final prediction column order
     final_pred_columns = []
     for col in TARGET_COLUMNS:
         final_pred_columns.append(f'{col}_chronos_pred')
@@ -282,21 +275,21 @@ def run_chronos_forecasting(pipeline, df):
             q_label = f"q{int(q_level * 100):02d}"
             final_pred_columns.append(f'{col}_chronos_{q_label}')
             
-    # 予測結果をDataFrameに結合
+    # Combine prediction results into a DataFrame
     for i, h_id in enumerate(HOUSEHOLD_ID_LIST):
-        if i >= len(mean_list): # スキップされた世帯を考慮
+        if i >= len(mean_list): # Account for skipped households
             continue
             
         mean_array = mean_list[i].numpy()
         quant_array = quantiles_list[i].numpy()
 
-        # 平均値の処理: (4, 12) -> (12, 4) へ転置
+        # Process Mean: Transpose from (4, 12) -> (12, 4)
         combined_df = pd.DataFrame(
             mean_array.T,
             columns=[f'{col}_chronos_pred' for col in TARGET_COLUMNS]
         )
 
-        # 9個の分位レベルを結合
+        # Combine 9 quantile levels
         for q_idx, q_level in enumerate(QUANTILE_LEVELS):
             q_label = f"q{int(q_level * 100):02d}"
             q_array_raw = quant_array[:, :, q_idx]
@@ -306,36 +299,36 @@ def run_chronos_forecasting(pipeline, df):
             )
             combined_df = pd.concat([combined_df, q_df], axis=1)
 
-        # ID列とTimestamp列の追加
+        # Add ID and Timestamp columns
         combined_df['ID'] = h_id
         combined_df['timestamp'] = forecast_periods
         all_preds_list.append(combined_df)
         
     final_predictions_df = pd.concat(all_preds_list, axis=0).reset_index(drop=True)
     
-    # 列の順序を [ID, timestamp, ...予測列] に変更
+    # Reorder columns: [ID, timestamp, ...prediction columns]
     new_order = ['ID', 'timestamp'] + final_pred_columns
     final_predictions_df = final_predictions_df[new_order]
 
-    # 結果の保存 (READMEに従い、ファイル名は `chronos_forecasts.csv` とします)
+    # Save results (Using .pkl format)
     output_pkl_path = "chronos_forecasts.pkl"
     final_predictions_df.to_pickle(output_pkl_path)
-    print(f"\n✅ 予測結果が整形され、'{output_pkl_path}' に保存されました。")
+    print(f"\n✅ Prediction results shaped and saved to '{output_pkl_path}'.")
     
-    # 予測結果のサマリーを表示
-    print("\n--- 予測結果（最初の5行） ---")
+    # Display prediction results summary
+    print("\n--- Prediction Results (First 5 rows) ---")
     display(final_predictions_df.head())
     
     return final_predictions_df
 
-# --- メイン処理の実行 ---
+# --- Main Execution ---
 try:
     processed_data = load_and_preprocess_data(CSV_FILE_NAME)
     if not processed_data.empty:
         run_chronos_forecasting(pipeline, processed_data)
-        print("\n=== Chronos予測の実行とエラーチェックが完了しました。===")
+        print("\n=== Chronos Prediction Execution and Error Check Completed. ===")
     else:
-        print("\n=== データ処理が中断されたため、Chronos予測は実行されませんでした。===")
+        print("\n=== Chronos Prediction skipped due to data processing interruption. ===")
 except Exception as e:
-    print(f"\n致命的なエラーが発生しました: {e}")
-    print("\n=== Chronos予測の実行中にエラーが発生しました。===")
+    print(f"\nFatal Error occurred: {e}")
+    print("\n=== Error occurred during Chronos Prediction execution. ===")
